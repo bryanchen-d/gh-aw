@@ -3705,6 +3705,189 @@ describe("add_comment", () => {
     });
   });
 
+  describe("401 Bad Credentials fallback (per-handler token)", () => {
+    it("should fall back to step-level token when per-handler token returns 401", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      const warningCalls = [];
+      mockCore.warning = msg => warningCalls.push(msg);
+      const errorCalls = [];
+      mockCore.error = msg => errorCalls.push(msg);
+
+      // Per-handler Octokit that returns 401 on createComment
+      const perHandlerClient = {
+        rest: {
+          issues: {
+            createComment: async () => {
+              const err = new Error("Bad credentials - https://docs.github.com/rest");
+              // @ts-ignore
+              err.status = 401;
+              throw err;
+            },
+            get: async () => ({ data: { labels: [], title: "Test PR" } }),
+          },
+          pulls: { createReplyForReviewComment: async () => {} },
+        },
+        graphql: async () => ({}),
+      };
+
+      // Step-level (global.github) createComment succeeds
+      let stepLevelCreateCommentCalled = false;
+      mockGithub.rest.issues.createComment = async params => {
+        stepLevelCreateCommentCalled = true;
+        return {
+          data: {
+            id: 99001,
+            html_url: `https://github.com/owner/repo/issues/${params.issue_number}#issuecomment-99001`,
+          },
+        };
+      };
+
+      // Set up global.getOctokit to return the per-handler client
+      const originalGetOctokit = global.getOctokit;
+      global.getOctokit = () => perHandlerClient;
+
+      try {
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main({ "github-token": "expired-pat" }); })()`);
+
+        const message = { type: "add_comment", body: "Nudge comment for PR", pr_number: 8535 };
+        const result = await handler(message, {});
+
+        expect(result.success).toBe(true);
+        expect(stepLevelCreateCommentCalled).toBe(true);
+        expect(warningCalls.some(w => /401.*step.level|step.level.*401|per-handler.*401|Bad Credentials/i.test(w))).toBe(true);
+        expect(errorCalls.filter(e => /failed to add comment/i.test(e))).toHaveLength(0);
+      } finally {
+        global.getOctokit = originalGetOctokit;
+      }
+    });
+
+    it("should return failure when both per-handler and step-level tokens return 401", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      const errorCalls = [];
+      mockCore.error = msg => errorCalls.push(msg);
+
+      const make401 = async () => {
+        const err = new Error("Bad credentials");
+        // @ts-ignore
+        err.status = 401;
+        throw err;
+      };
+
+      const perHandlerClient = {
+        rest: {
+          issues: { createComment: make401, get: async () => ({ data: { labels: [], title: "T" } }) },
+          pulls: { createReplyForReviewComment: make401 },
+        },
+        graphql: async () => ({}),
+      };
+
+      mockGithub.rest.issues.createComment = make401;
+
+      const originalGetOctokit = global.getOctokit;
+      global.getOctokit = () => perHandlerClient;
+
+      try {
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main({ "github-token": "bad-token" }); })()`);
+
+        const message = { type: "add_comment", body: "Test comment", pr_number: 8535 };
+        const result = await handler(message, {});
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBeTruthy();
+      } finally {
+        global.getOctokit = originalGetOctokit;
+      }
+    });
+
+    it("should not trigger fallback when no per-handler token is configured", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      const warningCalls = [];
+      mockCore.warning = msg => warningCalls.push(msg);
+
+      // Step-level token returns 401
+      mockGithub.rest.issues.createComment = async () => {
+        const err = new Error("Bad credentials");
+        // @ts-ignore
+        err.status = 401;
+        throw err;
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = { type: "add_comment", body: "Test comment" };
+      const result = await handler(message, {});
+
+      // Without per-handler token the 401 propagates as a regular failure (no fallback warning)
+      expect(result.success).toBe(false);
+      expect(warningCalls.some(w => /step.level|fallback.*token/i.test(w))).toBe(false);
+    });
+
+    it("should succeed in a mixed-batch: update_pull_request then add_comment with per-handler 401 fallback", async () => {
+      // Regression test for github/gh-aw#48714:
+      // update_pull_request succeeds with step-level token, then add_comment with an
+      // expired per-handler PAT should fall back and also succeed.
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      const warningCalls = [];
+      mockCore.warning = msg => warningCalls.push(msg);
+
+      // Simulate an expired per-handler Octokit
+      const expiredClient = {
+        rest: {
+          issues: {
+            createComment: async () => {
+              const err = new Error("Bad credentials");
+              // @ts-ignore
+              err.status = 401;
+              throw err;
+            },
+            get: async () => ({ data: { labels: [], title: "PR title" } }),
+          },
+          pulls: { createReplyForReviewComment: async () => {} },
+        },
+        graphql: async () => ({}),
+      };
+
+      // Step-level token createComment succeeds (simulating what happens after update_pull_request used step-level token)
+      let fallbackCallCount = 0;
+      mockGithub.rest.issues.createComment = async params => {
+        fallbackCallCount++;
+        return {
+          data: {
+            id: 55001,
+            html_url: `https://github.com/owner/repo/issues/${params.issue_number}#issuecomment-55001`,
+          },
+        };
+      };
+
+      const originalGetOctokit = global.getOctokit;
+      global.getOctokit = () => expiredClient;
+
+      try {
+        // Simulate two add_comment calls in one batch (matching the PR#48593 failure pattern)
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main({ "github-token": "expired-awi-maintenance-token", target: "*" }); })()`);
+
+        const msg1 = { type: "add_comment", body: "First nudge", pr_number: 8535 };
+        const msg2 = { type: "add_comment", body: "Second nudge", pr_number: 8536 };
+
+        const result1 = await handler(msg1, {});
+        const result2 = await handler(msg2, {});
+
+        expect(result1.success).toBe(true);
+        expect(result2.success).toBe(true);
+        // Both fell back to the step-level token
+        expect(fallbackCallCount).toBe(2);
+        // Warnings were emitted about the fallback
+        expect(warningCalls.filter(w => /per-handler|step.level|401/i.test(w)).length).toBeGreaterThanOrEqual(2);
+      } finally {
+        global.getOctokit = originalGetOctokit;
+      }
+    });
+  });
+
   let enforceCommentLimits;
   let MAX_COMMENT_LENGTH;
   let MAX_MENTIONS;

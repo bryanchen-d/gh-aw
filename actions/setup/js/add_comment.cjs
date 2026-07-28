@@ -416,6 +416,13 @@ async function main(config = {}) {
   // Create an authenticated GitHub client. Uses config["github-token"] when set
   // (for cross-repository operations), otherwise falls back to the step-level github.
   const githubClient = await createAuthenticatedGitHubClient(config);
+  // Capture the step-level github object so we can use it as a fallback when the
+  // per-handler token expires or is revoked (returns 401).
+  // @ts-ignore - global.github is set by setupGlobals() from github-script context
+  const stepLevelGithub = /** @type {any} */ global.github;
+  // Track whether a per-handler token was used so we can fall back to stepLevelGithub
+  // on 401 without breaking cross-repo configurations.
+  const usingPerHandlerToken = githubClient !== stepLevelGithub;
 
   // Check if we're in staged mode
   const isStaged = isStagedMode(config);
@@ -882,6 +889,63 @@ async function main(config = {}) {
       core.info(`Created comment: ${comment.html_url}`);
       return recordComment(comment, isDiscussion);
     } catch (error) {
+      // If the per-handler token returned 401 Bad Credentials, fall back to the step-level
+      // token and retry the comment creation. This handles expired or revoked per-handler
+      // PATs without failing the entire safe-output batch.
+      if (error?.status === 401 && usingPerHandlerToken) {
+        core.warning("Per-handler github-token returned 401 Bad Credentials; retrying comment creation with step-level token");
+        try {
+          /** @type {{ id: string | number, html_url: string }} */
+          let fallbackComment;
+          if (isDiscussion) {
+            const hasExplicitItemNumber = itemTargetResult.number !== null;
+            /** @type {string|null|undefined} */
+            let fallbackReplyToId = null;
+            if (context.eventName === "discussion_comment" && !hasExplicitItemNumber) {
+              fallbackReplyToId = await resolveTopLevelDiscussionCommentId(stepLevelGithub, context.payload?.comment?.node_id);
+            } else if (normalizedExplicitReplyToId) {
+              fallbackReplyToId = await resolveTopLevelDiscussionCommentId(stepLevelGithub, normalizedExplicitReplyToId);
+            }
+            fallbackComment = await commentOnDiscussion(stepLevelGithub, repoParts.owner, repoParts.repo, itemNumber, processedBody, fallbackReplyToId);
+          } else {
+            const shouldReplyFallback = effectiveContext.eventName === "pull_request_review_comment" && itemTargetResult.number === null;
+            const fallbackReviewCommentId = Number(effectiveContext.payload?.comment?.id);
+            if (shouldReplyFallback && Number.isInteger(fallbackReviewCommentId) && fallbackReviewCommentId > 0) {
+              const { data } = await stepLevelGithub.rest.pulls.createReplyForReviewComment({
+                owner: repoParts.owner,
+                repo: repoParts.repo,
+                pull_number: itemNumber,
+                comment_id: fallbackReviewCommentId,
+                body: processedBody,
+              });
+              fallbackComment = data;
+            } else if (commentIdToReuse !== null) {
+              const { data } = await stepLevelGithub.rest.issues.updateComment({
+                owner: repoParts.owner,
+                repo: repoParts.repo,
+                comment_id: commentIdToReuse,
+                body: processedBody,
+              });
+              fallbackComment = data;
+            } else {
+              const { data } = await stepLevelGithub.rest.issues.createComment({
+                owner: repoParts.owner,
+                repo: repoParts.repo,
+                issue_number: itemNumber,
+                body: processedBody,
+              });
+              fallbackComment = data;
+            }
+          }
+          core.info(`Created comment (step-level token): ${fallbackComment.html_url}`);
+          return recordComment(fallbackComment, isDiscussion);
+        } catch (fallbackError) {
+          const fallbackErrorMsg = getErrorMessage(fallbackError);
+          core.error(`Step-level token fallback also failed: ${fallbackErrorMsg}`);
+          return { success: false, error: fallbackErrorMsg };
+        }
+      }
+
       const errorMessage = getErrorMessage(error);
       const normalizedErrorMessage = errorMessage.toLowerCase();
       // Known GitHub lock-related message fragments observed from REST/GraphQL comment APIs.
