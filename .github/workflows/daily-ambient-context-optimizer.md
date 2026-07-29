@@ -332,6 +332,22 @@ When one or more are missing, include a recommendation to enable them and rewrit
 
 ## Rig Custom Harness Usage
 
+Before running Rig, audit past executions of this workflow (`daily-ambient-context-optimizer`) and infer the most efficient harness settings from evidence:
+
+1. From the downloaded run metadata, isolate recent completed runs of this workflow (prefer last 7 days, up to 10 runs).
+2. For each run, capture:
+   - whether harness output parsed as valid JSON on first try
+   - opportunities produced per harness invocation
+   - run-level AIC and turns
+3. Compute a compact efficiency summary:
+   - parse success rate
+   - median opportunities per harness call
+   - median AIC for this workflow
+4. Use this summary to choose Rig settings for the current run:
+   - default to a small model
+   - only raise model size when parse success rate is below 90% or median opportunities per call is below 1.0 across at least 3 prior runs
+   - keep one harness invocation per sampled run unless prior evidence shows multi-pass is required
+
 After the deterministic Python script finishes, use a Rig custom harness for **at most 2 sampled runs** (only when at least 2 sampled runs exist):
 
 1. Discover the installed launcher path:
@@ -347,6 +363,7 @@ Harness guardrails:
 - no raw request bodies in harness input
 - use a small model unless deterministic evidence shows quality loss
 - one harness run per sampled run (no retries without a concrete parse/runtime error)
+- limit harness input to compact evidence fields (run metadata, derived metrics, top repeated fragments, and optional short workflow excerpt)
 
 ## Execution Budget Guardrails
 
