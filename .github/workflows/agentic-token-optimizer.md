@@ -148,11 +148,17 @@ gh api "repos/$REPO/actions/workflows/my-workflow.yml/runs?per_page=10" \
 gh api "repos/$REPO/contents/.github/workflows/my-workflow.md" \
   --jq '.content' | base64 -d | sed -n '1,/^---$/{ /^---$/d; p }' | head -40
 
+# ✅ Inject an entire markdown file into a safe-output body as explicit JSON
+jq -Rs --arg title "$ISSUE_TITLE" \
+  '{title: $title, body: .}' \
+  /tmp/gh-aw/agent/optimization-issue.md \
+  | safeoutputs create_issue .
+
 # ❌ Never load full unfiltered responses — drops everything into context
 gh api "repos/$REPO/actions/workflows/my-workflow.yml/runs"
 ```
 
-Prefer `--jq` on `gh api` calls over a separate `| jq` step when the filter is simple — it avoids piping the full response through the shell. Use `| jq` for multi-step transformations or when chaining with other commands.
+Prefer `--jq` on `gh api` calls over a separate `| jq` step when the filter is simple — it avoids piping the full response through the shell. Use `| jq` for multi-step transformations or when chaining with other commands. When a safe-output body already lives in a file, use `jq -Rs` or `jq -n --rawfile` to build an explicit JSON object instead of piping raw markdown directly into `safeoutputs`.
 
 ## Data Inputs
 
