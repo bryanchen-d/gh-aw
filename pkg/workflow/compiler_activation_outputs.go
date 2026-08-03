@@ -151,6 +151,31 @@ func (c *Compiler) configureActivationNeedsAndCondition(ctx *activationJobBuildC
 	}
 }
 
+// activationArtifactPaths returns the list of files and directories collected into the
+// activation artifact, which is later unpacked into /tmp/gh-aw in downstream jobs.
+func activationArtifactPaths(data *WorkflowData) []string {
+	paths := []string{
+		"/tmp/gh-aw/aw_info.json",
+		"/tmp/gh-aw/models.json",
+		"/tmp/gh-aw/aw-prompts/prompt.txt",
+		"/tmp/gh-aw/aw-prompts/prompt-template.txt",
+		"/tmp/gh-aw/aw-prompts/prompt-import-tree.json",
+		"/tmp/gh-aw/" + constants.GithubRateLimitsFilename,
+		"/tmp/gh-aw/base",
+	}
+	engineID := resolveActivationEngineID(data)
+	// Include the engine-specific sub-agent staging directory only when inline agents are enabled.
+	if isFeatureEnabled(constants.FeatureFlag("inline-agents"), data) {
+		paths = append(paths, "/tmp/gh-aw/"+GetEngineSubAgentDir(engineID))
+	}
+	// Always include the engine-specific skill directory when either inline skills are enabled
+	// or frontmatter skills are configured (via Skills or SkillReferences).
+	if isFeatureEnabled(constants.FeatureFlag("inline-agents"), data) || len(data.Skills) > 0 || len(data.SkillReferences) > 0 {
+		paths = append(paths, "/tmp/gh-aw/"+GetEngineSkillDir(engineID))
+	}
+	return paths
+}
+
 // addActivationArtifactUploadStep appends the activation artifact upload step for downstream jobs.
 func (c *Compiler) addActivationArtifactUploadStep(ctx *activationJobBuildContext) {
 	compilerActivationJobLog.Print("Adding activation artifact upload step")
@@ -162,24 +187,8 @@ func (c *Compiler) addActivationArtifactUploadStep(ctx *activationJobBuildContex
 	ctx.steps = append(ctx.steps, fmt.Sprintf("          name: %s\n", activationArtifactName))
 	ctx.steps = append(ctx.steps, "          include-hidden-files: true\n")
 	ctx.steps = append(ctx.steps, "          path: |\n")
-	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/aw_info.json\n")
-	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/models.json\n")
-	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/aw-prompts/prompt.txt\n")
-	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/aw-prompts/prompt-template.txt\n")
-	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/aw-prompts/prompt-import-tree.json\n")
-	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/"+constants.GithubRateLimitsFilename+"\n")
-	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/base\n")
-	engineID := resolveActivationEngineID(ctx.data)
-	// Include the engine-specific sub-agent staging directory only when inline agents are enabled.
-	if isFeatureEnabled(constants.FeatureFlag("inline-agents"), ctx.data) {
-		subAgentDir := GetEngineSubAgentDir(engineID)
-		ctx.steps = append(ctx.steps, fmt.Sprintf("            /tmp/gh-aw/%s\n", subAgentDir))
-	}
-	// Always include the engine-specific skill directory when either inline skills are enabled
-	// or frontmatter skills are configured (via Skills or SkillReferences).
-	if isFeatureEnabled(constants.FeatureFlag("inline-agents"), ctx.data) || len(ctx.data.Skills) > 0 || len(ctx.data.SkillReferences) > 0 {
-		skillDir := GetEngineSkillDir(engineID)
-		ctx.steps = append(ctx.steps, fmt.Sprintf("            /tmp/gh-aw/%s\n", skillDir))
+	for _, path := range activationArtifactPaths(ctx.data) {
+		ctx.steps = append(ctx.steps, fmt.Sprintf("            %s\n", path))
 	}
 	ctx.steps = append(ctx.steps, "          if-no-files-found: ignore\n")
 	ctx.steps = append(ctx.steps, "          retention-days: 1\n")

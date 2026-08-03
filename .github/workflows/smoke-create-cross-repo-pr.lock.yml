@@ -456,6 +456,7 @@ jobs:
       - name: Print prompt
         env:
           GH_AW_PROMPT: /tmp/gh-aw/aw-prompts/prompt.txt
+          GH_AW_ACTIVATION_ARTIFACT_PATHS: "/tmp/gh-aw/aw_info.json\n/tmp/gh-aw/models.json\n/tmp/gh-aw/aw-prompts/prompt.txt\n/tmp/gh-aw/aw-prompts/prompt-template.txt\n/tmp/gh-aw/aw-prompts/prompt-import-tree.json\n/tmp/gh-aw/github_rate_limits.jsonl\n/tmp/gh-aw/base\n/tmp/gh-aw/.github/agents\n/tmp/gh-aw/.github/skills"
         # poutine:ignore untrusted_checkout_exec
         run: bash "${RUNNER_TEMP}/gh-aw/actions/print_prompt_summary.sh"
       - name: Upload activation artifact

@@ -83,7 +83,7 @@ func (c *Compiler) generatePrompt(yaml *strings.Builder, data *WorkflowData, pre
 	}
 
 	writePromptBashStep(yaml, "Validate prompt placeholders", "validate_prompt_placeholders.sh")
-	writePromptBashStep(yaml, "Print prompt", "print_prompt_summary.sh")
+	writePromptSummaryStep(yaml, data)
 }
 
 // enrichExpressionMappings extracts expressions from the main workflow markdown, filters them
@@ -299,6 +299,18 @@ func writePromptBashStep(yaml *strings.Builder, name, script string) {
 	yaml.WriteString("          GH_AW_PROMPT: /tmp/gh-aw/aw-prompts/prompt.txt\n")
 	yaml.WriteString("        # poutine:ignore untrusted_checkout_exec\n")
 	fmt.Fprintf(yaml, "        run: bash \"${RUNNER_TEMP}/gh-aw/actions/%s\"\n", script)
+}
+
+// writePromptSummaryStep emits the "Print prompt" step, passing the list of activation
+// artifact paths so the step summary can also render the files that will be unpacked
+// and placed for the agent.
+func writePromptSummaryStep(yaml *strings.Builder, data *WorkflowData) {
+	yaml.WriteString("      - name: Print prompt\n")
+	yaml.WriteString("        env:\n")
+	yaml.WriteString("          GH_AW_PROMPT: /tmp/gh-aw/aw-prompts/prompt.txt\n")
+	fmt.Fprintf(yaml, "          GH_AW_ACTIVATION_ARTIFACT_PATHS: %q\n", strings.Join(activationArtifactPaths(data), "\n"))
+	yaml.WriteString("        # poutine:ignore untrusted_checkout_exec\n")
+	yaml.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/print_prompt_summary.sh\"\n")
 }
 
 // extractPromptChunksFromMarkdown applies the standard post-processing pipeline to a markdown body:
