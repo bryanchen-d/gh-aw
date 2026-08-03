@@ -206,6 +206,22 @@ func TestGenerateMaintenanceWorkflow_WithExpires(t *testing.T) {
 			expectWorkflowGenerated: true,
 			expectError:             false,
 		},
+		{
+			name: "with implicitly enabled noop - should NOT generate workflow",
+			workflowDataList: []*WorkflowData{
+				{
+					Name: "noop-implicit-workflow",
+					SafeOutputs: &SafeOutputsConfig{
+						NoOp: &NoOpConfig{
+							ReportAsIssue: strPtr("true"),
+							Implicit:      true,
+						},
+					},
+				},
+			},
+			expectWorkflowGenerated: false,
+			expectError:             false,
+		},
 	}
 
 	for _, tt := range tests {
