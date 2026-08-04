@@ -155,7 +155,8 @@ async function pushExtraEmptyCommit({ branchName, repoOwner, repoName, commitMes
     // completes without throwing, so the finally clause skips restoration when
     // the override was never applied (avoiding a spurious --unset-all that would
     // destroy existing checkout credentials).
-    let previousExtraheaders = [];
+    /** @type {Awaited<ReturnType<typeof overridePersistedExtraheader>> | undefined} */
+    let previousExtraheaders;
     let overrideApplied = false;
     try {
       core.info(`Overriding git extraheader for CI trigger push to ${repoOwner}/${repoName} on branch ${branchName}`);

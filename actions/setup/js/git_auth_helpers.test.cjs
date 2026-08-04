@@ -6,15 +6,21 @@ describe("git_auth_helpers.cjs", () => {
   let checkoutHasPersistedExtraheader;
   let overridePersistedExtraheader;
   let restorePersistedExtraheader;
-  let unsetExtraheaderAllScopes;
   let withGitHubHostToken;
+  let originalGitConfigEnvironment;
 
   const SERVER_URL = "https://github.com";
   const EXTRAHEADER_KEY = "http.https://github.com/.extraheader";
 
   beforeEach(() => {
+    originalGitConfigEnvironment = Object.fromEntries(Object.entries(process.env).filter(([name]) => /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(name)));
+    for (const name of Object.keys(process.env).filter(name => /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(name))) {
+      delete process.env[name];
+    }
+
     mockCore = {
       info: vi.fn(),
+      setSecret: vi.fn(),
       warning: vi.fn(),
     };
 
@@ -29,10 +35,14 @@ describe("git_auth_helpers.cjs", () => {
     global.exec = mockExec;
 
     delete require.cache[require.resolve("./git_auth_helpers.cjs")];
-    ({ checkoutHasPersistedExtraheader, overridePersistedExtraheader, restorePersistedExtraheader, unsetExtraheaderAllScopes, withGitHubHostToken } = require("./git_auth_helpers.cjs"));
+    ({ checkoutHasPersistedExtraheader, overridePersistedExtraheader, restorePersistedExtraheader, withGitHubHostToken } = require("./git_auth_helpers.cjs"));
   });
 
   afterEach(() => {
+    for (const name of Object.keys(process.env).filter(name => /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(name))) {
+      delete process.env[name];
+    }
+    Object.assign(process.env, originalGitConfigEnvironment);
     delete global.core;
     delete global.exec;
     vi.clearAllMocks();
@@ -70,112 +80,52 @@ describe("git_auth_helpers.cjs", () => {
   });
 
   // ──────────────────────────────────────────────────────
-  // unsetExtraheaderAllScopes
-  // ──────────────────────────────────────────────────────
-
-  describe("unsetExtraheaderAllScopes", () => {
-    it("should unset from global and local scopes", async () => {
-      await unsetExtraheaderAllScopes(EXTRAHEADER_KEY);
-
-      expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["config", "--global", "--unset-all", EXTRAHEADER_KEY], expect.objectContaining({ ignoreReturnCode: true }));
-      expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["config", "--local", "--unset-all", EXTRAHEADER_KEY], expect.objectContaining({ ignoreReturnCode: true }));
-    });
-
-    it("should pass cwd to both scope unset calls", async () => {
-      const cwd = "/some/repo";
-      await unsetExtraheaderAllScopes(EXTRAHEADER_KEY, cwd);
-
-      for (const call of mockExec.getExecOutput.mock.calls) {
-        expect(call[2]).toMatchObject({ cwd });
-      }
-    });
-
-    it("should not throw when key is absent (exit code 5)", async () => {
-      mockExec.getExecOutput.mockResolvedValue({ exitCode: 5, stdout: "", stderr: "" });
-
-      await expect(unsetExtraheaderAllScopes(EXTRAHEADER_KEY)).resolves.toBeUndefined();
-    });
-
-    it("should throw when a scope unset fails with an unexpected non-zero exit code", async () => {
-      // Exit code 4 = file write error (permission denied, config lock, etc.)
-      mockExec.getExecOutput.mockResolvedValue({ exitCode: 4, stdout: "", stderr: "error: could not lock config file" });
-
-      await expect(unsetExtraheaderAllScopes(EXTRAHEADER_KEY)).rejects.toThrow(/--unset-all.*failed \(exit 4\)/);
-    });
-  });
-
-  // ──────────────────────────────────────────────────────
   // overridePersistedExtraheader
   // ──────────────────────────────────────────────────────
 
   describe("overridePersistedExtraheader", () => {
-    it("should clear all scopes before writing the new token", async () => {
+    it("should add an empty reset followed by the masked token", async () => {
       const token = "ghp_test_token";
+      const encodedToken = Buffer.from(`x-access-token:${token}`).toString("base64");
+      const expectedHeader = `Authorization: basic ${encodedToken}`;
 
       await overridePersistedExtraheader(SERVER_URL, token);
 
-      expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["config", "--global", "--unset-all", EXTRAHEADER_KEY], expect.objectContaining({ ignoreReturnCode: true }));
-      expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["config", "--local", "--unset-all", EXTRAHEADER_KEY], expect.objectContaining({ ignoreReturnCode: true }));
+      expect(process.env.GIT_CONFIG_COUNT).toBe("2");
+      expect(process.env.GIT_CONFIG_KEY_0).toBe(EXTRAHEADER_KEY);
+      expect(process.env.GIT_CONFIG_VALUE_0).toBe("");
+      expect(process.env.GIT_CONFIG_KEY_1).toBe(EXTRAHEADER_KEY);
+      expect(process.env.GIT_CONFIG_VALUE_1).toBe(expectedHeader);
+      expect(mockCore.setSecret).toHaveBeenCalledWith(encodedToken);
+      expect(mockExec.exec).not.toHaveBeenCalled();
     });
 
-    it("should replace the extraheader with the CI token using --local scope", async () => {
-      const token = "ghp_test_token";
-      const expectedHeader = `Authorization: basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
+    it("should append to and restore an existing Git environment config", async () => {
+      process.env.GIT_CONFIG_COUNT = "1";
+      process.env.GIT_CONFIG_KEY_0 = "user.name";
+      process.env.GIT_CONFIG_VALUE_0 = "Test User";
+      process.env.GIT_CONFIG_KEY_1 = "preexisting-ignored-key";
 
-      await overridePersistedExtraheader(SERVER_URL, token);
+      const state = await overridePersistedExtraheader(SERVER_URL, "fork-token");
 
-      expect(mockExec.exec).toHaveBeenCalledWith("git", ["config", "--local", "--replace-all", EXTRAHEADER_KEY, expectedHeader]);
+      expect(process.env.GIT_CONFIG_COUNT).toBe("3");
+      expect(process.env.GIT_CONFIG_KEY_1).toBe(EXTRAHEADER_KEY);
+      expect(process.env.GIT_CONFIG_KEY_2).toBe(EXTRAHEADER_KEY);
+      await restorePersistedExtraheader(SERVER_URL, state);
+      expect(process.env.GIT_CONFIG_COUNT).toBe("1");
+      expect(process.env.GIT_CONFIG_KEY_0).toBe("user.name");
+      expect(process.env.GIT_CONFIG_VALUE_0).toBe("Test User");
+      expect(process.env.GIT_CONFIG_KEY_1).toBe("preexisting-ignored-key");
+      expect(process.env.GIT_CONFIG_KEY_2).toBeUndefined();
     });
 
-    it("should return empty array when no previous extraheader exists", async () => {
-      mockExec.getExecOutput.mockImplementation(async (_cmd, args) => {
-        // Only the --get-all read returns empty; unset-all calls use ignoreReturnCode
-        if (args[1] === "--get-all") return { exitCode: 1, stdout: "", stderr: "" };
-        return { exitCode: 5, stdout: "", stderr: "" }; // key not found
-      });
+    it("should reject an invalid existing GIT_CONFIG_COUNT before mutation", async () => {
+      process.env.GIT_CONFIG_COUNT = "not-a-number";
 
-      const previous = await overridePersistedExtraheader(SERVER_URL, "ghp_test_token");
+      await expect(overridePersistedExtraheader(SERVER_URL, "fork-token")).rejects.toThrow("Invalid GIT_CONFIG_COUNT");
 
-      expect(previous).toEqual([]);
-    });
-
-    it("should return previous extraheader values when one exists", async () => {
-      const prevHeader = `Authorization: basic ${Buffer.from("x-access-token:old_token").toString("base64")}`;
-      mockExec.getExecOutput.mockImplementation(async (_cmd, args) => {
-        if (args[1] === "--get-all") return { exitCode: 0, stdout: prevHeader + "\n", stderr: "" };
-        return { exitCode: 5, stdout: "", stderr: "" };
-      });
-
-      const previous = await overridePersistedExtraheader(SERVER_URL, "ghp_new_token");
-
-      expect(previous).toEqual([prevHeader]);
-    });
-
-    it("should return multiple previous values when multi-value extraheader exists", async () => {
-      const header1 = `Authorization: basic ${Buffer.from("x-access-token:tok1").toString("base64")}`;
-      const header2 = `Authorization: basic ${Buffer.from("x-access-token:tok2").toString("base64")}`;
-      mockExec.getExecOutput.mockImplementation(async (_cmd, args) => {
-        if (args[1] === "--get-all") return { exitCode: 0, stdout: `${header1}\n${header2}\n`, stderr: "" };
-        return { exitCode: 5, stdout: "", stderr: "" };
-      });
-
-      const previous = await overridePersistedExtraheader(SERVER_URL, "ghp_new_token");
-
-      expect(previous).toEqual([header1, header2]);
-    });
-
-    it("should warn and fall back to empty array when reading previous values fails", async () => {
-      mockExec.getExecOutput.mockImplementation(async (_cmd, args) => {
-        if (args[1] === "--get-all") throw new Error("git read error");
-        return { exitCode: 5, stdout: "", stderr: "" };
-      });
-
-      const previous = await overridePersistedExtraheader(SERVER_URL, "ghp_test_token");
-
-      expect(previous).toEqual([]);
-      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("could not read existing extraheader"));
-      // Override should still proceed despite read failure
-      expect(mockExec.exec).toHaveBeenCalledWith("git", ["config", "--local", "--replace-all", EXTRAHEADER_KEY, expect.any(String)]);
+      expect(process.env.GIT_CONFIG_COUNT).toBe("not-a-number");
+      expect(process.env.GIT_CONFIG_KEY_0).toBeUndefined();
     });
 
     it("should trim the token before base64-encoding", async () => {
@@ -184,34 +134,23 @@ describe("git_auth_helpers.cjs", () => {
       await overridePersistedExtraheader(SERVER_URL, token);
 
       const expected = `Authorization: basic ${Buffer.from("x-access-token:ghp_padded_token").toString("base64")}`;
-      expect(mockExec.exec).toHaveBeenCalledWith("git", ["config", "--local", "--replace-all", EXTRAHEADER_KEY, expected]);
+      expect(process.env.GIT_CONFIG_VALUE_1).toBe(expected);
     });
 
-    it("should log the number of existing values before overriding", async () => {
-      const header = `Authorization: basic ${Buffer.from("x-access-token:tok").toString("base64")}`;
-      mockExec.getExecOutput.mockImplementation(async (_cmd, args) => {
-        if (args[1] === "--get-all") return { exitCode: 0, stdout: header + "\n", stderr: "" };
-        return { exitCode: 5, stdout: "", stderr: "" };
-      });
+    it("should warn but continue when the diagnostic config read fails", async () => {
+      mockExec.getExecOutput.mockRejectedValue(new Error("git read error"));
 
       await overridePersistedExtraheader(SERVER_URL, "new_token");
 
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("1 existing extraheader value(s)"));
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("could not read existing extraheader"));
+      expect(process.env.GIT_CONFIG_COUNT).toBe("2");
     });
 
-    it("should strip trailing slash from server URL when reading previous values", async () => {
-      // Use exit code 5 (key absent) for all calls so --unset-all is treated as "not found",
-      // which is the expected state when testing URL normalization in isolation.
-      mockExec.getExecOutput.mockResolvedValue({ exitCode: 5, stdout: "", stderr: "" });
-
+    it("should strip a trailing slash from the environment config key", async () => {
       await overridePersistedExtraheader("https://github.com/", "ghp_test_token");
 
-      // "https://github.com/" (with trailing slash) must be normalized to
-      // "https://github.com" (without) for both the git config read and write.
-      // Using the literal normalized key makes the assertion explicit.
-      const normalizedKey = "http.https://github.com/.extraheader";
-      expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["config", "--get-all", normalizedKey], expect.anything());
-      expect(mockExec.exec).toHaveBeenCalledWith("git", ["config", "--local", "--replace-all", normalizedKey, expect.any(String)]);
+      expect(process.env.GIT_CONFIG_KEY_0).toBe(EXTRAHEADER_KEY);
+      expect(process.env.GIT_CONFIG_KEY_1).toBe(EXTRAHEADER_KEY);
     });
   });
 
@@ -220,76 +159,7 @@ describe("git_auth_helpers.cjs", () => {
   // ──────────────────────────────────────────────────────
 
   describe("restorePersistedExtraheader", () => {
-    it("should clear all scopes when previousValues is empty", async () => {
-      await restorePersistedExtraheader(SERVER_URL, []);
-
-      expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["config", "--global", "--unset-all", EXTRAHEADER_KEY], expect.objectContaining({ ignoreReturnCode: true }));
-      expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["config", "--local", "--unset-all", EXTRAHEADER_KEY], expect.objectContaining({ ignoreReturnCode: true }));
-      // Should not call exec.exec (no values to write back)
-      expect(mockExec.exec).not.toHaveBeenCalled();
-    });
-
-    it("should not throw when key is absent (exit code 5) when clearing scopes", async () => {
-      mockExec.getExecOutput.mockResolvedValue({ exitCode: 5, stdout: "", stderr: "" });
-
-      await expect(restorePersistedExtraheader(SERVER_URL, [])).resolves.toBeUndefined();
-    });
-
-    it("should use --local --replace-all to restore a single previous value", async () => {
-      const prevHeader = `Authorization: basic ${Buffer.from("x-access-token:old").toString("base64")}`;
-
-      await restorePersistedExtraheader(SERVER_URL, [prevHeader]);
-
-      expect(mockExec.exec).toHaveBeenCalledWith("git", ["config", "--local", "--replace-all", EXTRAHEADER_KEY, prevHeader]);
-      expect(mockExec.exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["--add"]));
-    });
-
-    it("should restore multiple values using --local --replace-all then --local --add", async () => {
-      const header1 = `Authorization: basic ${Buffer.from("x-access-token:tok1").toString("base64")}`;
-      const header2 = `Authorization: basic ${Buffer.from("x-access-token:tok2").toString("base64")}`;
-
-      await restorePersistedExtraheader(SERVER_URL, [header1, header2]);
-
-      const calls = mockExec.exec.mock.calls;
-      const replaceCall = calls.find(c => c[1][1] === "--local" && c[1][2] === "--replace-all");
-      const addCall = calls.find(c => c[1][1] === "--local" && c[1][2] === "--add");
-
-      expect(replaceCall).toBeDefined();
-      expect(replaceCall[1][4]).toBe(header1);
-      expect(addCall).toBeDefined();
-      expect(addCall[1][4]).toBe(header2);
-      // --replace-all must come before --add
-      expect(calls.indexOf(replaceCall)).toBeLessThan(calls.indexOf(addCall));
-    });
-
-    it("should attempt cleanup via unsetExtraheaderAllScopes and re-throw when --add fails mid-restore", async () => {
-      const header1 = `Authorization: basic ${Buffer.from("x-access-token:tok1").toString("base64")}`;
-      const header2 = `Authorization: basic ${Buffer.from("x-access-token:tok2").toString("base64")}`;
-      const addError = new Error("git config --add failed");
-
-      mockExec.exec.mockImplementation(async (_cmd, args) => {
-        if (args[1] === "--local" && args[2] === "--add") throw addError;
-        return 0;
-      });
-
-      await expect(restorePersistedExtraheader(SERVER_URL, [header1, header2])).rejects.toThrow(addError);
-
-      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("partial extraheader restore"));
-      // Cleanup should use unsetExtraheaderAllScopes (getExecOutput calls for --unset-all)
-      const unsetCalls = mockExec.getExecOutput.mock.calls.filter(c => c[1][2] === "--unset-all");
-      expect(unsetCalls.length).toBeGreaterThan(0);
-    });
-
-    it("should strip trailing slash from server URL for the config key", async () => {
-      await restorePersistedExtraheader("https://github.com/", []);
-
-      expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["config", "--global", "--unset-all", EXTRAHEADER_KEY], expect.anything());
-      expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["config", "--local", "--unset-all", EXTRAHEADER_KEY], expect.anything());
-    });
-
-    it("should not throw when previousValues is null/undefined (treated as empty)", async () => {
-      // null is treated as empty by the length check
-      // @ts-expect-error intentional null test
+    it("should not throw when previous state is null", async () => {
       await expect(restorePersistedExtraheader(SERVER_URL, null)).resolves.toBeUndefined();
     });
   });
@@ -321,44 +191,25 @@ describe("git_auth_helpers.cjs", () => {
     it("should override extraheader with fork token before calling callback", async () => {
       const token = "fork-token";
       const expectedHeader = `Authorization: basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
-      const execCalls = [];
-
-      mockExec.exec.mockImplementation(async (_cmd, args) => {
-        execCalls.push(args);
-        return 0;
-      });
 
       await withGitHubHostToken(token, async () => {
-        // Inside callback the override should already be applied
-        const overrideCall = execCalls.find(a => a[2] === "--replace-all");
-        expect(overrideCall).toBeDefined();
-        expect(overrideCall[4]).toBe(expectedHeader);
+        expect(process.env.GIT_CONFIG_COUNT).toBe("2");
+        expect(process.env.GIT_CONFIG_VALUE_0).toBe("");
+        expect(process.env.GIT_CONFIG_VALUE_1).toBe(expectedHeader);
       });
     });
 
-    it("should restore the previous extraheader after the callback completes", async () => {
-      const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
-      mockExec.getExecOutput.mockImplementation(async (_cmd, args) => {
-        if (args[1] === "--get-all") return { exitCode: 0, stdout: upstreamHeader + "\n", stderr: "" };
-        return { exitCode: 5, stdout: "", stderr: "" };
-      });
+    it("should restore the previous environment after the callback completes", async () => {
+      process.env.GIT_CONFIG_COUNT = "0";
 
       await withGitHubHostToken("fork-token", async () => {});
 
-      // After callback, the last --replace-all should restore the upstream header
-      const replaceAllCalls = mockExec.exec.mock.calls.filter(c => c[1][2] === "--replace-all");
-      expect(replaceAllCalls.length).toBeGreaterThanOrEqual(2);
-      const restoreCall = replaceAllCalls[replaceAllCalls.length - 1];
-      expect(restoreCall[1][4]).toBe(upstreamHeader);
+      expect(process.env.GIT_CONFIG_COUNT).toBe("0");
+      expect(process.env.GIT_CONFIG_KEY_0).toBeUndefined();
+      expect(process.env.GIT_CONFIG_VALUE_0).toBeUndefined();
     });
 
-    it("should restore extraheader even when the callback throws", async () => {
-      const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
-      mockExec.getExecOutput.mockImplementation(async (_cmd, args) => {
-        if (args[1] === "--get-all") return { exitCode: 0, stdout: upstreamHeader + "\n", stderr: "" };
-        return { exitCode: 5, stdout: "", stderr: "" };
-      });
-
+    it("should restore the environment even when the callback throws", async () => {
       const callbackError = new Error("push failed");
       await expect(
         withGitHubHostToken("fork-token", async () => {
@@ -366,30 +217,8 @@ describe("git_auth_helpers.cjs", () => {
         })
       ).rejects.toThrow(callbackError);
 
-      // Restore must still run after the callback throws — the last --replace-all is the restore
-      const replaceAllCalls = mockExec.exec.mock.calls.filter(c => c[1][2] === "--replace-all");
-      expect(replaceAllCalls.length).toBeGreaterThanOrEqual(2);
-      const restoreCall = replaceAllCalls[replaceAllCalls.length - 1];
-      expect(restoreCall[1][4]).toBe(upstreamHeader);
-    });
-
-    it("should clear all scopes after callback when no previous value existed", async () => {
-      // Exit code 5 = key absent (the expected state when no extraheader is configured).
-      // Using 1 here would cause unsetExtraheaderAllScopes to throw as of the fixed implementation.
-      mockExec.getExecOutput.mockResolvedValue({ exitCode: 5, stdout: "", stderr: "" });
-
-      await withGitHubHostToken("fork-token", async () => {});
-
-      // Restore should call unsetExtraheaderAllScopes (global + local unset-all)
-      const unsetCalls = mockExec.getExecOutput.mock.calls.filter(c => c[1][2] === "--unset-all");
-      expect(unsetCalls.length).toBeGreaterThanOrEqual(2);
-      const keys = unsetCalls.map(c => c[1][3]);
-      expect(keys).toContain(EXTRAHEADER_KEY);
-      // Should NOT call exec.exec for restore (no values to write back)
-      const restoreExecCalls = mockExec.exec.mock.calls.filter(c => c[1][2] === "--replace-all");
-      // First --replace-all is the override; no second one since previousValues is []
-      // Check only one --replace-all call (the override itself)
-      expect(restoreExecCalls.length).toBe(1);
+      expect(process.env.GIT_CONFIG_COUNT).toBeUndefined();
+      expect(process.env.GIT_CONFIG_KEY_0).toBeUndefined();
     });
 
     it("should return the callback's return value", async () => {
@@ -397,90 +226,28 @@ describe("git_auth_helpers.cjs", () => {
       expect(result).toBe("expected-result");
     });
 
-    it("should pass cwd to overridePersistedExtraheader and restorePersistedExtraheader", async () => {
+    it("should pass cwd to the diagnostic config read", async () => {
       const cwd = "/some/repo";
-      const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
-      mockExec.getExecOutput.mockImplementation(async (_cmd, args) => {
-        if (args[1] === "--get-all") return { exitCode: 0, stdout: upstreamHeader + "\n", stderr: "" };
-        return { exitCode: 5, stdout: "", stderr: "" };
-      });
 
       await withGitHubHostToken("fork-token", async () => {}, cwd);
 
-      // All git config calls should include cwd
-      for (const call of mockExec.exec.mock.calls) {
-        expect(call[2]).toMatchObject({ cwd });
-      }
       for (const call of mockExec.getExecOutput.mock.calls) {
         expect(call[2]).toMatchObject({ cwd });
       }
     });
 
-    it("should not accumulate extraheader values across multiple override/restore cycles", async () => {
-      // Regression test: verifies header cardinality stays at 1 across retries.
-      //
-      // Simulates real git config state with independent global and local scopes so that
-      // --unset-all, --replace-all, and --get-all operations interact with the same in-memory
-      // state. Without this, --get-all is hard-coded to one value regardless of what the other
-      // commands do, meaning the test would pass even with the old accumulating implementation.
-      //
-      // Bug: getExtraheaderValues reads ALL scopes (--get-all), but the old --replace-all
-      // without an explicit scope only wrote to local, leaving the global value intact.
-      // After each restore both scopes held a copy, so the next --get-all returned N+1 values.
-      const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
-
-      // Simulate git config state: actions/checkout writes the upstream token to global scope.
-      let globalValues = [upstreamHeader];
-      let localValues = [];
-
-      mockExec.getExecOutput.mockImplementation(async (_cmd, args) => {
-        if (args[1] === "--get-all") {
-          // git config --get-all reads from all scopes combined
-          const all = [...globalValues, ...localValues];
-          return all.length > 0 ? { exitCode: 0, stdout: all.join("\n") + "\n", stderr: "" } : { exitCode: 5, stdout: "", stderr: "" };
-        }
-        if (args[2] === "--unset-all") {
-          if (args[1] === "--global") {
-            const hadValues = globalValues.length > 0;
-            globalValues = [];
-            return { exitCode: hadValues ? 0 : 5, stdout: "", stderr: "" };
-          }
-          if (args[1] === "--local") {
-            const hadValues = localValues.length > 0;
-            localValues = [];
-            return { exitCode: hadValues ? 0 : 5, stdout: "", stderr: "" };
-          }
-        }
-        return { exitCode: 5, stdout: "", stderr: "" };
+    it("should support nested token overrides", async () => {
+      await withGitHubHostToken("outer-token", async () => {
+        expect(process.env.GIT_CONFIG_COUNT).toBe("2");
+        const outerHeader = process.env.GIT_CONFIG_VALUE_1;
+        await withGitHubHostToken("inner-token", async () => {
+          expect(process.env.GIT_CONFIG_COUNT).toBe("4");
+          expect(process.env.GIT_CONFIG_VALUE_3).not.toBe(outerHeader);
+        });
+        expect(process.env.GIT_CONFIG_COUNT).toBe("2");
+        expect(process.env.GIT_CONFIG_VALUE_1).toBe(outerHeader);
       });
-
-      mockExec.exec.mockImplementation(async (_cmd, args) => {
-        if (args[1] === "--local" && args[2] === "--replace-all") {
-          localValues = [args[4]];
-          return 0;
-        }
-        if (args[1] === "--local" && args[2] === "--add") {
-          localValues.push(args[4]);
-          return 0;
-        }
-        return 0;
-      });
-
-      let capturedPreviousValueCounts = [];
-      mockCore.info.mockImplementation(msg => {
-        const m = msg.match(/read (\d+) existing extraheader value/);
-        if (m) capturedPreviousValueCounts.push(Number(m[1]));
-      });
-
-      // Run two override/restore cycles (simulating a retry scenario)
-      for (let i = 0; i < 2; i++) {
-        await withGitHubHostToken("fork-token", async () => {});
-      }
-
-      // Both cycles should read exactly 1 value — no accumulation.
-      // Without the fix (no --global unset before writing), the second cycle would
-      // see both global and local copies of the token and return 2.
-      expect(capturedPreviousValueCounts).toEqual([1, 1]);
+      expect(process.env.GIT_CONFIG_COUNT).toBeUndefined();
     });
   });
 });

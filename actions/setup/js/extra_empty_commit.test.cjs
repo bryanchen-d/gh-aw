@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
+const EXTRAHEADER_KEY = "http.https://github.com/.extraheader";
+
 describe("extra_empty_commit.cjs", () => {
   let mockCore;
   let mockExec;
@@ -7,8 +9,14 @@ describe("extra_empty_commit.cjs", () => {
   let originalEnv;
   let originalGithubRepo;
   let originalGithubServerUrl;
+  let originalGitConfigEnvironment;
 
   beforeEach(() => {
+    originalGitConfigEnvironment = Object.fromEntries(Object.entries(process.env).filter(([name]) => /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(name)));
+    for (const name of Object.keys(process.env).filter(name => /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(name))) {
+      delete process.env[name];
+    }
+
     originalEnv = process.env.GH_AW_CI_TRIGGER_TOKEN;
     originalGithubRepo = process.env.GITHUB_REPOSITORY;
     originalGithubServerUrl = process.env.GITHUB_SERVER_URL;
@@ -20,21 +28,14 @@ describe("extra_empty_commit.cjs", () => {
       info: vi.fn(),
       warning: vi.fn(),
       error: vi.fn(),
+      setSecret: vi.fn(),
       setFailed: vi.fn(),
     };
 
     // Default exec mock: resolves successfully, no stdout output
     mockExec = {
       exec: vi.fn().mockResolvedValue(0),
-      getExecOutput: vi.fn().mockImplementation(async (_cmd, args) => {
-        // Handle git config --global/--local --unset-all calls from unsetExtraheaderAllScopes
-        // Return exit code 5 (key absent) since most tests simulate no pre-existing extraheaders
-        if (args && args[0] === "config" && (args[1] === "--global" || args[1] === "--local") && args[2] === "--unset-all") {
-          return { exitCode: 5, stdout: "", stderr: "" };
-        }
-        // Default: return exit code 1 (generic failure) for other getExecOutput calls
-        return { stdout: "", stderr: "", exitCode: 1 };
-      }),
+      getExecOutput: vi.fn().mockResolvedValue({ stdout: "", stderr: "", exitCode: 1 }),
     };
 
     global.core = mockCore;
@@ -49,6 +50,10 @@ describe("extra_empty_commit.cjs", () => {
   });
 
   afterEach(() => {
+    for (const name of Object.keys(process.env).filter(name => /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(name))) {
+      delete process.env[name];
+    }
+    Object.assign(process.env, originalGitConfigEnvironment);
     if (originalEnv !== undefined) {
       process.env.GH_AW_CI_TRIGGER_TOKEN = originalEnv;
     } else {
@@ -175,7 +180,19 @@ describe("extra_empty_commit.cjs", () => {
       expect(removeRemoteCalls.length).toBeGreaterThanOrEqual(1);
     });
 
-    it("should replace extraheader auth before push and restore it after push", async () => {
+    it("should apply the environment extraheader override only during push", async () => {
+      let environmentAtPush;
+      mockExec.exec.mockImplementation(async (_cmd, args) => {
+        if (args?.[0] === "push") {
+          environmentAtPush = {
+            count: process.env.GIT_CONFIG_COUNT,
+            reset: process.env.GIT_CONFIG_VALUE_0,
+            header: process.env.GIT_CONFIG_VALUE_1,
+          };
+        }
+        return 0;
+      });
+
       await pushExtraEmptyCommit({
         branchName: "feature-branch",
         repoOwner: "test-owner",
@@ -183,36 +200,21 @@ describe("extra_empty_commit.cjs", () => {
       });
 
       const execCalls = mockExec.exec.mock.calls;
-      // Use findIndex so the assertion stays correct even if restorePersistedExtraheader
-      // also emits a --replace-all call (e.g. when restoring previous values).
-      const replaceIdx = execCalls.findIndex(c => c[0] === "git" && c[1] && c[1][0] === "config" && c[1][1] === "--local" && c[1][2] === "--replace-all");
-      expect(replaceIdx).toBeGreaterThanOrEqual(0);
-      const replaceCall = execCalls[replaceIdx];
-      expect(replaceCall[1][3]).toBe("http.https://github.com/.extraheader");
-      expect(replaceCall[1][4]).toBe(`Authorization: basic ${Buffer.from("x-access-token:ghp_test_token_123").toString("base64")}`);
-
       const pushIdx = execCalls.findIndex(c => c[0] === "git" && c[1] && c[1][0] === "push");
       expect(pushIdx).toBeGreaterThan(-1);
-      expect(replaceIdx).toBeLessThan(pushIdx);
-
-      // After push, restoration clears credentials via getExecOutput (unsetExtraheaderAllScopes)
-      // When there are no previous values to restore, only the unset happens.
-      const getExecOutputCalls = mockExec.getExecOutput.mock.calls;
-      const unsetCall = getExecOutputCalls.find(c => c[0] === "git" && c[1] && c[1][0] === "config" && c[1][2] === "--unset-all");
-      expect(unsetCall).toBeDefined();
+      expect(environmentAtPush).toEqual({
+        count: "2",
+        reset: "",
+        header: `Authorization: basic ${Buffer.from("x-access-token:ghp_test_token_123").toString("base64")}`,
+      });
+      expect(process.env.GIT_CONFIG_COUNT).toBeUndefined();
     });
 
-    it("should restore a previously-set extraheader after push", async () => {
+    it("should restore a pre-existing Git environment config after push", async () => {
       const prevHeader = `Authorization: basic ${Buffer.from("x-access-token:old_token").toString("base64")}`;
-      // Override getExecOutput so it returns the previous header when reading the extraheader key.
-      mockExec.getExecOutput.mockImplementation(async (cmd, args) => {
-        // Handle git config --global/--local --unset-all calls
-        if (args && args[0] === "config" && (args[1] === "--global" || args[1] === "--local") && args[2] === "--unset-all") {
-          return { exitCode: 5, stdout: "", stderr: "" };
-        }
-        // Return previous header for --get-all
-        return { exitCode: 0, stdout: prevHeader + "\n", stderr: "" };
-      });
+      process.env.GIT_CONFIG_COUNT = "1";
+      process.env.GIT_CONFIG_KEY_0 = EXTRAHEADER_KEY;
+      process.env.GIT_CONFIG_VALUE_0 = prevHeader;
 
       await pushExtraEmptyCommit({
         branchName: "feature-branch",
@@ -220,20 +222,17 @@ describe("extra_empty_commit.cjs", () => {
         repoName: "test-repo",
       });
 
-      const execCalls = mockExec.exec.mock.calls;
-      const pushIdx = execCalls.findIndex(c => c[0] === "git" && c[1] && c[1][0] === "push");
-      expect(pushIdx).toBeGreaterThan(-1);
-
-      // After push, there should be a --local --replace-all that restores the old header.
-      const restoreCall = execCalls.find((c, i) => i > pushIdx && c[0] === "git" && c[1] && c[1][0] === "config" && c[1][1] === "--local" && c[1][2] === "--replace-all");
-      expect(restoreCall).toBeDefined();
-      expect(restoreCall[1][4]).toBe(prevHeader);
+      expect(process.env.GIT_CONFIG_COUNT).toBe("1");
+      expect(process.env.GIT_CONFIG_KEY_0).toBe(EXTRAHEADER_KEY);
+      expect(process.env.GIT_CONFIG_VALUE_0).toBe(prevHeader);
+      expect(process.env.GIT_CONFIG_KEY_1).toBeUndefined();
     });
 
     it("should restore extraheader even when push throws", async () => {
-      // Simulate push failure
+      let configCountAtPush;
       mockExec.exec.mockImplementation(async (cmd, args) => {
         if (cmd === "git" && args && args[0] === "push") {
+          configCountAtPush = process.env.GIT_CONFIG_COUNT;
           throw new Error("remote: Permission denied");
         }
         return 0;
@@ -246,18 +245,8 @@ describe("extra_empty_commit.cjs", () => {
       });
 
       expect(result.success).toBe(false);
-
-      const execCalls = mockExec.exec.mock.calls;
-
-      // The override (--local --replace-all with CI token) must have happened before the failed push.
-      const overrideIdx = execCalls.findIndex(c => c[0] === "git" && c[1] && c[1][0] === "config" && c[1][1] === "--local" && c[1][2] === "--replace-all");
-      expect(overrideIdx).toBeGreaterThanOrEqual(0);
-
-      // After the failed push, the finally block must restore by unsetting the key
-      // (default mock returns no previous extraheader). Check getExecOutput calls.
-      const getExecOutputCalls = mockExec.getExecOutput.mock.calls;
-      const unsetCall = getExecOutputCalls.find(c => c[0] === "git" && c[1] && c[1][0] === "config" && c[1][2] === "--unset-all");
-      expect(unsetCall).toBeDefined();
+      expect(configCountAtPush).toBe("2");
+      expect(process.env.GIT_CONFIG_COUNT).toBeUndefined();
     });
 
     it("should fetch and reset to remote branch before committing", async () => {
@@ -550,14 +539,8 @@ describe("extra_empty_commit.cjs", () => {
         repoName: "test-repo",
       });
 
-      const execCalls = mockExec.exec.mock.calls;
-      // Override was applied before the API commit (--local --replace-all)
-      const overrideCall = execCalls.find(c => c[0] === "git" && c[1] && c[1][0] === "config" && c[1][1] === "--local" && c[1][2] === "--replace-all");
-      expect(overrideCall).toBeDefined();
-      // After the API commit, unsetExtraheaderAllScopes is called (via getExecOutput)
-      const getExecOutputCalls = mockExec.getExecOutput.mock.calls;
-      const unsetCall = getExecOutputCalls.find(c => c[0] === "git" && c[1] && c[1][0] === "config" && c[1][2] === "--unset-all");
-      expect(unsetCall).toBeDefined();
+      expect(mockCore.setSecret).toHaveBeenCalled();
+      expect(process.env.GIT_CONFIG_COUNT).toBeUndefined();
     });
   });
 
@@ -976,7 +959,7 @@ describe("isCrossRepoTarget", () => {
   beforeEach(() => {
     originalGithubRepo = process.env.GITHUB_REPOSITORY;
     // Provide minimal globals so the module loads
-    global.core = { info: vi.fn(), warning: vi.fn(), error: vi.fn(), setFailed: vi.fn() };
+    global.core = { info: vi.fn(), warning: vi.fn(), error: vi.fn(), setSecret: vi.fn(), setFailed: vi.fn() };
     global.exec = { exec: vi.fn().mockResolvedValue(0) };
     delete require.cache[require.resolve("./extra_empty_commit.cjs")];
     ({ isCrossRepoTarget } = require("./extra_empty_commit.cjs"));

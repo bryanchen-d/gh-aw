@@ -1,17 +1,20 @@
 // Integration tests for git_auth_helpers.cjs.
 //
-// These tests use real git repositories so that --get-all, --unset-all,
-// --replace-all, and --add operations interact with the same on-disk state.
+// These tests use real git repositories so environment overlays interact with
+// global, local, and included config exactly as Git processes them.
 // Global git config is isolated via GIT_CONFIG_GLOBAL so no test can pollute
 // the developer's real ~/.gitconfig.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
+import http from "http";
 import os from "os";
 import path from "path";
-import { spawnSync } from "child_process";
+import { execFile, spawnSync } from "child_process";
 import { createRequire } from "module";
+import { promisify } from "util";
 
 const require = createRequire(import.meta.url);
+const execFileAsync = promisify(execFile);
 
 const SERVER_URL = "https://github.com";
 const EXTRAHEADER_KEY = `http.${SERVER_URL}/.extraheader`;
@@ -98,11 +101,40 @@ function readConfigValues(key, scopeFlag, repoDir, globalConfigPath) {
 }
 
 /**
+ * Read the headers Git will effectively send. An empty extraheader resets all
+ * inherited values that precede it.
+ */
+function readEffectiveConfigValues(key, repoDir, globalConfigPath) {
+  const r = runGit(["config", "--get-all", key], repoDir, globalConfigPath);
+  if (r.status !== 0) return [];
+  const values = r.stdout.replace(/\r/g, "").split("\n");
+  if (values.at(-1) === "") values.pop();
+  const resetIndex = values.lastIndexOf("");
+  return values.slice(resetIndex + 1).filter(Boolean);
+}
+
+/**
  * Write a single value to the given scope.
  */
 function writeConfigValue(key, value, scopeFlag, repoDir, globalConfigPath) {
   const r = runGit(["config", scopeFlag, "--add", key, value], repoDir, globalConfigPath);
   if (r.status !== 0) throw new Error(`git config write failed: ${r.stderr}`);
+}
+
+/**
+ * Persist a credential using the actions/checkout v7 layout: the header lives
+ * in a RUNNER_TEMP file referenced by a repository-local includeIf entry.
+ */
+function writeCheckoutV7Credential(header, root, repoDir, globalConfigPath, serverUrl = SERVER_URL) {
+  const credentialsPath = path.join(root, "git-credentials-12345678-1234-1234-1234-123456789abc.config");
+  fs.writeFileSync(credentialsPath, `[http "${serverUrl}/"]\n\textraheader = ${header}\n`);
+
+  const gitDir = path.join(repoDir, ".git").replace(/\\/g, "/");
+  const includeKey = `includeIf.gitdir:${gitDir}.path`;
+  const r = runGit(["config", "--local", "--add", includeKey, credentialsPath], repoDir, globalConfigPath);
+  if (r.status !== 0) throw new Error(`git config includeIf write failed: ${r.stderr}`);
+
+  return { credentialsPath, includeKey };
 }
 
 // ---------------------------------------------------------------------------
@@ -116,19 +148,28 @@ describe("git_auth_helpers.cjs git integration", () => {
   let mockCore;
   let overridePersistedExtraheader;
   let restorePersistedExtraheader;
-  let unsetExtraheaderAllScopes;
   let withGitHubHostToken;
 
   let origGithubServerUrl;
+  let origRunnerTemp;
+  let originalGitConfigEnvironment;
 
   beforeEach(() => {
     ({ root, repoDir, globalConfigPath } = createIsolatedRepo("git-auth-helpers-it-"));
 
+    originalGitConfigEnvironment = Object.fromEntries(Object.entries(process.env).filter(([name]) => /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(name)));
+    for (const name of Object.keys(process.env).filter(name => /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(name))) {
+      delete process.env[name];
+    }
+
     origGithubServerUrl = process.env.GITHUB_SERVER_URL;
+    origRunnerTemp = process.env.RUNNER_TEMP;
     process.env.GITHUB_SERVER_URL = SERVER_URL;
+    process.env.RUNNER_TEMP = root;
 
     mockCore = {
       info: vi.fn(),
+      setSecret: vi.fn(),
       warning: vi.fn(),
     };
 
@@ -136,10 +177,14 @@ describe("git_auth_helpers.cjs git integration", () => {
     global.exec = createExecApi(repoDir, globalConfigPath);
 
     delete require.cache[require.resolve("./git_auth_helpers.cjs")];
-    ({ overridePersistedExtraheader, restorePersistedExtraheader, unsetExtraheaderAllScopes, withGitHubHostToken } = require("./git_auth_helpers.cjs"));
+    ({ overridePersistedExtraheader, restorePersistedExtraheader, withGitHubHostToken } = require("./git_auth_helpers.cjs"));
   });
 
   afterEach(() => {
+    for (const name of Object.keys(process.env).filter(name => /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(name))) {
+      delete process.env[name];
+    }
+    Object.assign(process.env, originalGitConfigEnvironment);
     if (root && fs.existsSync(root)) {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -148,51 +193,14 @@ describe("git_auth_helpers.cjs git integration", () => {
     } else {
       delete process.env.GITHUB_SERVER_URL;
     }
+    if (origRunnerTemp !== undefined) {
+      process.env.RUNNER_TEMP = origRunnerTemp;
+    } else {
+      delete process.env.RUNNER_TEMP;
+    }
     delete global.core;
     delete global.exec;
     vi.clearAllMocks();
-  });
-
-  // ──────────────────────────────────────────────────────
-  // unsetExtraheaderAllScopes
-  // ──────────────────────────────────────────────────────
-
-  describe("unsetExtraheaderAllScopes", () => {
-    it("clears a value from the global scope", async () => {
-      writeConfigValue(EXTRAHEADER_KEY, "Authorization: basic abc", "--global", repoDir, globalConfigPath);
-      expect(readConfigValues(EXTRAHEADER_KEY, "--global", repoDir, globalConfigPath)).toHaveLength(1);
-
-      await unsetExtraheaderAllScopes(EXTRAHEADER_KEY, repoDir);
-
-      expect(readConfigValues(EXTRAHEADER_KEY, "--global", repoDir, globalConfigPath)).toHaveLength(0);
-    });
-
-    it("clears a value from the local scope", async () => {
-      writeConfigValue(EXTRAHEADER_KEY, "Authorization: basic abc", "--local", repoDir, globalConfigPath);
-      expect(readConfigValues(EXTRAHEADER_KEY, "--local", repoDir, globalConfigPath)).toHaveLength(1);
-
-      await unsetExtraheaderAllScopes(EXTRAHEADER_KEY, repoDir);
-
-      expect(readConfigValues(EXTRAHEADER_KEY, "--local", repoDir, globalConfigPath)).toHaveLength(0);
-    });
-
-    it("clears values from both global and local scopes simultaneously", async () => {
-      writeConfigValue(EXTRAHEADER_KEY, "Authorization: basic global", "--global", repoDir, globalConfigPath);
-      writeConfigValue(EXTRAHEADER_KEY, "Authorization: basic local", "--local", repoDir, globalConfigPath);
-      // Both scopes have a value; --get-all should return 2
-      expect(readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath)).toHaveLength(2);
-
-      await unsetExtraheaderAllScopes(EXTRAHEADER_KEY, repoDir);
-
-      expect(readConfigValues(EXTRAHEADER_KEY, "--global", repoDir, globalConfigPath)).toHaveLength(0);
-      expect(readConfigValues(EXTRAHEADER_KEY, "--local", repoDir, globalConfigPath)).toHaveLength(0);
-      expect(readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath)).toHaveLength(0);
-    });
-
-    it("does not throw when the key is absent in both scopes (exit code 5)", async () => {
-      // No value written — key is absent in all scopes.
-      await expect(unsetExtraheaderAllScopes(EXTRAHEADER_KEY, repoDir)).resolves.toBeUndefined();
-    });
   });
 
   // ──────────────────────────────────────────────────────
@@ -200,7 +208,7 @@ describe("git_auth_helpers.cjs git integration", () => {
   // ──────────────────────────────────────────────────────
 
   describe("overridePersistedExtraheader", () => {
-    it("removes the global token and writes only the fork token to local scope", async () => {
+    it("overrides a global token without mutating file-backed config", async () => {
       const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
       const forkToken = "fork-token-123";
       const expectedForkHeader = `Authorization: basic ${Buffer.from(`x-access-token:${forkToken}`).toString("base64")}`;
@@ -209,31 +217,31 @@ describe("git_auth_helpers.cjs git integration", () => {
 
       await overridePersistedExtraheader(SERVER_URL, forkToken, repoDir);
 
-      // Global must be empty
-      expect(readConfigValues(EXTRAHEADER_KEY, "--global", repoDir, globalConfigPath)).toHaveLength(0);
-      // Local must have exactly the fork token
-      expect(readConfigValues(EXTRAHEADER_KEY, "--local", repoDir, globalConfigPath)).toEqual([expectedForkHeader]);
-      // get-all must see exactly one header
-      expect(readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath)).toEqual([expectedForkHeader]);
+      expect(readConfigValues(EXTRAHEADER_KEY, "--global", repoDir, globalConfigPath)).toEqual([upstreamHeader]);
+      expect(readConfigValues(EXTRAHEADER_KEY, "--local", repoDir, globalConfigPath)).toEqual([]);
+      expect(readEffectiveConfigValues(EXTRAHEADER_KEY, repoDir, globalConfigPath)).toEqual([expectedForkHeader]);
     });
 
-    it("returns the upstream header that was in the global scope before the override", async () => {
-      const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
-      writeConfigValue(EXTRAHEADER_KEY, upstreamHeader, "--global", repoDir, globalConfigPath);
-
-      const previous = await overridePersistedExtraheader(SERVER_URL, "fork-token", repoDir);
-
-      expect(previous).toEqual([upstreamHeader]);
-    });
-
-    it("returns an empty array and still writes fork token when no extraheader exists", async () => {
+    it("returns environment state and still writes the fork token when no header exists", async () => {
       const forkToken = "fork-only";
       const expectedForkHeader = `Authorization: basic ${Buffer.from(`x-access-token:${forkToken}`).toString("base64")}`;
 
       const previous = await overridePersistedExtraheader(SERVER_URL, forkToken, repoDir);
 
-      expect(previous).toEqual([]);
-      expect(readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath)).toEqual([expectedForkHeader]);
+      expect(previous.previousEnvironment.GIT_CONFIG_COUNT).toBeUndefined();
+      expect(readEffectiveConfigValues(EXTRAHEADER_KEY, repoDir, globalConfigPath)).toEqual([expectedForkHeader]);
+    });
+
+    it("does not mutate checkout v7 config when the environment count is invalid", async () => {
+      const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
+      const { credentialsPath, includeKey } = writeCheckoutV7Credential(upstreamHeader, root, repoDir, globalConfigPath);
+      process.env.GIT_CONFIG_COUNT = "invalid";
+
+      await expect(overridePersistedExtraheader(SERVER_URL, "fork-token", repoDir)).rejects.toThrow("Invalid GIT_CONFIG_COUNT");
+      delete process.env.GIT_CONFIG_COUNT;
+      expect(readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath)).toEqual([upstreamHeader]);
+      expect(readConfigValues(EXTRAHEADER_KEY, "--local", repoDir, globalConfigPath)).toEqual([]);
+      expect(readConfigValues(includeKey, "--local", repoDir, globalConfigPath)).toEqual([credentialsPath]);
     });
   });
 
@@ -242,31 +250,19 @@ describe("git_auth_helpers.cjs git integration", () => {
   // ──────────────────────────────────────────────────────
 
   describe("restorePersistedExtraheader", () => {
-    it("removes the fork token from local and restores the upstream token to local", async () => {
-      const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
-      const forkHeader = `Authorization: basic ${Buffer.from("x-access-token:fork").toString("base64")}`;
+    it("restores only the environment variables changed by override", async () => {
+      process.env.GIT_CONFIG_COUNT = "1";
+      process.env.GIT_CONFIG_KEY_0 = "user.email";
+      process.env.GIT_CONFIG_VALUE_0 = "test@example.com";
 
-      // Simulate the state after an override: global is empty, local has the fork token.
-      writeConfigValue(EXTRAHEADER_KEY, forkHeader, "--local", repoDir, globalConfigPath);
+      const state = await overridePersistedExtraheader(SERVER_URL, "fork-token", repoDir);
+      await restorePersistedExtraheader(SERVER_URL, state, repoDir);
 
-      await restorePersistedExtraheader(SERVER_URL, [upstreamHeader], repoDir);
-
-      // Global must remain empty
-      expect(readConfigValues(EXTRAHEADER_KEY, "--global", repoDir, globalConfigPath)).toHaveLength(0);
-      // Local must have the restored upstream token
-      expect(readConfigValues(EXTRAHEADER_KEY, "--local", repoDir, globalConfigPath)).toEqual([upstreamHeader]);
-      // get-all must see exactly one header
-      expect(readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath)).toEqual([upstreamHeader]);
-    });
-
-    it("clears all scopes and writes nothing when previousValues is empty", async () => {
-      const forkHeader = `Authorization: basic ${Buffer.from("x-access-token:fork").toString("base64")}`;
-      writeConfigValue(EXTRAHEADER_KEY, forkHeader, "--local", repoDir, globalConfigPath);
-
-      await restorePersistedExtraheader(SERVER_URL, [], repoDir);
-
-      expect(readConfigValues(EXTRAHEADER_KEY, "--global", repoDir, globalConfigPath)).toHaveLength(0);
-      expect(readConfigValues(EXTRAHEADER_KEY, "--local", repoDir, globalConfigPath)).toHaveLength(0);
+      expect(process.env.GIT_CONFIG_COUNT).toBe("1");
+      expect(process.env.GIT_CONFIG_KEY_0).toBe("user.email");
+      expect(process.env.GIT_CONFIG_VALUE_0).toBe("test@example.com");
+      expect(process.env.GIT_CONFIG_KEY_1).toBeUndefined();
+      expect(process.env.GIT_CONFIG_VALUE_1).toBeUndefined();
     });
   });
 
@@ -276,10 +272,8 @@ describe("git_auth_helpers.cjs git integration", () => {
 
   describe("withGitHubHostToken", () => {
     it("does not accumulate extraheader values across multiple override/restore cycles", async () => {
-      // Simulates the exact production failure: actions/checkout writes the upstream
-      // token to the global scope.  Without the scope-clearing fix, each restore would
-      // leave the global value intact and add a new local copy, so --get-all returns
-      // N+1 values on each subsequent cycle.
+      // Simulates a direct upstream credential while two fork-token callbacks
+      // run in sequence.
       const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
       writeConfigValue(EXTRAHEADER_KEY, upstreamHeader, "--global", repoDir, globalConfigPath);
 
@@ -294,8 +288,7 @@ describe("git_auth_helpers.cjs git integration", () => {
         await withGitHubHostToken("fork-token", async () => {}, repoDir);
       }
 
-      // Without the fix: [1, 2] — second cycle sees global + local copies.
-      // With the fix: [1, 1] — global is always cleared before each write.
+      // Environment overlays leave file-backed config unchanged.
       expect(capturedCounts).toEqual([1, 1]);
     });
 
@@ -309,7 +302,7 @@ describe("git_auth_helpers.cjs git integration", () => {
       await withGitHubHostToken(
         forkToken,
         async () => {
-          valuesInsideCallback = readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath);
+          valuesInsideCallback = readEffectiveConfigValues(EXTRAHEADER_KEY, repoDir, globalConfigPath);
         },
         repoDir
       );
@@ -324,9 +317,11 @@ describe("git_auth_helpers.cjs git integration", () => {
 
       await withGitHubHostToken("fork-token", async () => {}, repoDir);
 
-      // After restore, exactly the upstream token should be in local scope (global was cleared)
+      // Restore preserves the original global scope.
       const allValues = readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath);
       expect(allValues).toEqual([upstreamHeader]);
+      expect(readConfigValues(EXTRAHEADER_KEY, "--global", repoDir, globalConfigPath)).toEqual([upstreamHeader]);
+      expect(readConfigValues(EXTRAHEADER_KEY, "--local", repoDir, globalConfigPath)).toEqual([]);
     });
 
     it("restores the config even when the callback throws", async () => {
@@ -345,6 +340,145 @@ describe("git_auth_helpers.cjs git integration", () => {
 
       const allValues = readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath);
       expect(allValues).toEqual([upstreamHeader]);
+    });
+
+    it("temporarily replaces an actions/checkout v7 includeIf credential", async () => {
+      const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
+      const forkToken = "fork-include-check";
+      const expectedForkHeader = `Authorization: basic ${Buffer.from(`x-access-token:${forkToken}`).toString("base64")}`;
+      const { credentialsPath, includeKey } = writeCheckoutV7Credential(upstreamHeader, root, repoDir, globalConfigPath);
+
+      expect(readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath)).toEqual([upstreamHeader]);
+
+      const valuesInsideCallbacks = [];
+      for (let cycle = 0; cycle < 2; cycle++) {
+        await withGitHubHostToken(
+          forkToken,
+          async () => {
+            valuesInsideCallbacks.push(readEffectiveConfigValues(EXTRAHEADER_KEY, repoDir, globalConfigPath));
+            expect(readConfigValues(includeKey, "--local", repoDir, globalConfigPath)).toEqual([credentialsPath]);
+          },
+          repoDir
+        );
+      }
+
+      expect(valuesInsideCallbacks).toEqual([[expectedForkHeader], [expectedForkHeader]]);
+      expect(readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath)).toEqual([upstreamHeader]);
+      expect(readConfigValues(EXTRAHEADER_KEY, "--local", repoDir, globalConfigPath)).toEqual([]);
+      expect(readConfigValues(includeKey, "--local", repoDir, globalConfigPath)).toEqual([credentialsPath]);
+      expect(fs.existsSync(credentialsPath)).toBe(true);
+    });
+
+    it("sends only the fork Authorization header on the wire", async () => {
+      const requests = [];
+      const server = http.createServer((request, response) => {
+        const authorizationHeaders = [];
+        for (let index = 0; index < request.rawHeaders.length; index += 2) {
+          if (request.rawHeaders[index].toLowerCase() === "authorization") {
+            authorizationHeaders.push(request.rawHeaders[index + 1]);
+          }
+        }
+        requests.push(authorizationHeaders);
+        response.statusCode = 401;
+        response.end();
+      });
+      await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+
+      try {
+        const address = server.address();
+        const serverUrl = `http://127.0.0.1:${address.port}`;
+        const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
+        const forkToken = "fork-wire-check";
+        const expectedAuthorization = `basic ${Buffer.from(`x-access-token:${forkToken}`).toString("base64")}`;
+        writeCheckoutV7Credential(upstreamHeader, root, repoDir, globalConfigPath, serverUrl);
+        process.env.GITHUB_SERVER_URL = serverUrl;
+
+        await withGitHubHostToken(
+          forkToken,
+          async () => {
+            await expect(
+              execFileAsync("git", ["ls-remote", `${serverUrl}/repo.git`], {
+                cwd: repoDir,
+                env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+              })
+            ).rejects.toThrow();
+          },
+          repoDir
+        );
+
+        expect(requests.length).toBeGreaterThan(0);
+        expect(requests[0]).toEqual([expectedAuthorization]);
+        expect(requests.every(headers => headers.length <= 1)).toBe(true);
+      } finally {
+        await new Promise(resolve => server.close(resolve));
+      }
+    });
+
+    it("restores an actions/checkout v7 includeIf credential when the callback throws", async () => {
+      const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
+      const { credentialsPath, includeKey } = writeCheckoutV7Credential(upstreamHeader, root, repoDir, globalConfigPath);
+
+      await expect(
+        withGitHubHostToken(
+          "fork-token",
+          async () => {
+            throw new Error("simulated callback failure");
+          },
+          repoDir
+        )
+      ).rejects.toThrow("simulated callback failure");
+
+      expect(readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath)).toEqual([upstreamHeader]);
+      expect(readConfigValues(EXTRAHEADER_KEY, "--local", repoDir, globalConfigPath)).toEqual([]);
+      expect(readConfigValues(includeKey, "--local", repoDir, globalConfigPath)).toEqual([credentialsPath]);
+    });
+
+    it("preserves unrelated includeIf values and their order", async () => {
+      const upstreamHeader = `Authorization: basic ${Buffer.from("x-access-token:upstream").toString("base64")}`;
+      const ghesHeader = `Authorization: basic ${Buffer.from("x-access-token:ghes").toString("base64")}`;
+      const ghesKey = "http.https://ghe.example.com/.extraheader";
+      const { credentialsPath, includeKey } = writeCheckoutV7Credential(upstreamHeader, root, repoDir, globalConfigPath);
+      const ghesCredentialsPath = path.join(root, "git-credentials-87654321-4321-4321-4321-cba987654321.config");
+      fs.writeFileSync(ghesCredentialsPath, `[http "https://ghe.example.com/"]\n\textraheader = ${ghesHeader}\n`);
+      const addResult = runGit(["config", "--local", "--add", includeKey, ghesCredentialsPath], repoDir, globalConfigPath);
+      if (addResult.status !== 0) throw new Error(`git config includeIf write failed: ${addResult.stderr}`);
+
+      const originalIncludeValues = [credentialsPath, ghesCredentialsPath];
+      expect(readConfigValues(includeKey, "--local", repoDir, globalConfigPath)).toEqual(originalIncludeValues);
+
+      await withGitHubHostToken(
+        "fork-token",
+        async () => {
+          expect(readConfigValues(includeKey, "--local", repoDir, globalConfigPath)).toEqual(originalIncludeValues);
+          expect(readConfigValues(ghesKey, null, repoDir, globalConfigPath)).toEqual([ghesHeader]);
+        },
+        repoDir
+      );
+
+      expect(readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath)).toEqual([upstreamHeader]);
+      expect(readConfigValues(ghesKey, null, repoDir, globalConfigPath)).toEqual([ghesHeader]);
+      expect(readConfigValues(includeKey, "--local", repoDir, globalConfigPath)).toEqual(originalIncludeValues);
+    });
+
+    it("handles a direct extraheader and checkout v7 include together", async () => {
+      const includedHeader = `Authorization: basic ${Buffer.from("x-access-token:included").toString("base64")}`;
+      const directHeader = `Authorization: basic ${Buffer.from("x-access-token:direct").toString("base64")}`;
+      const forkToken = "fork-mixed-state";
+      const expectedForkHeader = `Authorization: basic ${Buffer.from(`x-access-token:${forkToken}`).toString("base64")}`;
+      writeCheckoutV7Credential(includedHeader, root, repoDir, globalConfigPath);
+      writeConfigValue(EXTRAHEADER_KEY, directHeader, "--global", repoDir, globalConfigPath);
+
+      expect(readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath)).toHaveLength(2);
+
+      await withGitHubHostToken(
+        forkToken,
+        async () => {
+          expect(readEffectiveConfigValues(EXTRAHEADER_KEY, repoDir, globalConfigPath)).toEqual([expectedForkHeader]);
+        },
+        repoDir
+      );
+
+      expect(readConfigValues(EXTRAHEADER_KEY, null, repoDir, globalConfigPath).sort()).toEqual([directHeader, includedHeader].sort());
     });
   });
 });

@@ -227,7 +227,8 @@ async function lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken
   let result;
   if (pushRemoteUrl && pushToken) {
     const githubServerUrl = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
-    let previousExtraheaders = [];
+    /** @type {Awaited<ReturnType<typeof overridePersistedExtraheader>> | undefined} */
+    let previousExtraheaders;
     let overrideApplied = false;
     try {
       previousExtraheaders = await overridePersistedExtraheader(githubServerUrl, pushToken, cwd);
@@ -271,7 +272,8 @@ async function pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl
   }
 
   const githubServerUrl = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
-  let previousExtraheaders = [];
+  /** @type {Awaited<ReturnType<typeof overridePersistedExtraheader>> | undefined} */
+  let previousExtraheaders;
   let overrideApplied = false;
   try {
     previousExtraheaders = await overridePersistedExtraheader(githubServerUrl, pushToken, cwd);
