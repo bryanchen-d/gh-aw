@@ -137,6 +137,50 @@ describe("generateGitBundle (incremental)", () => {
     expect(generatedBundleHeads).toBe(naiveBundleHeads);
   });
 
+  it("does not run checkout hooks when synthesizing a filtered bundle", async () => {
+    const remoteDir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-bundle-hook-remote-"));
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-bundle-hook-work-"));
+    const hooksDir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-bundle-hooks-"));
+    tempDirs.push(remoteDir, workDir, hooksDir);
+
+    execGit(["init", "--bare"], { cwd: remoteDir });
+    execGit(["clone", remoteDir, workDir]);
+    execGit(["config", "user.name", "Test User"], { cwd: workDir });
+    execGit(["config", "user.email", "test@example.com"], { cwd: workDir });
+
+    fs.writeFileSync(path.join(workDir, "base.txt"), "base\n");
+    execGit(["add", "base.txt"], { cwd: workDir });
+    execGit(["commit", "-m", "base"], { cwd: workDir });
+    execGit(["branch", "-M", "main"], { cwd: workDir });
+    execGit(["push", "-u", "origin", "main"], { cwd: workDir });
+
+    execGit(["checkout", "-b", "pr-branch"], { cwd: workDir });
+    fs.writeFileSync(path.join(workDir, "pr.txt"), "pr start\n");
+    execGit(["add", "pr.txt"], { cwd: workDir });
+    execGit(["commit", "-m", "pr start"], { cwd: workDir });
+    execGit(["push", "-u", "origin", "pr-branch"], { cwd: workDir });
+
+    fs.writeFileSync(path.join(workDir, "pr-2.txt"), "pr second\n");
+    execGit(["add", "pr-2.txt"], { cwd: workDir });
+    execGit(["commit", "-m", "pr second"], { cwd: workDir });
+
+    const postCheckoutHook = path.join(hooksDir, "post-checkout");
+    fs.writeFileSync(postCheckoutHook, "#!/bin/sh\nexit 2\n");
+    fs.chmodSync(postCheckoutHook, 0o755);
+    execGit(["config", "core.hooksPath", hooksDir], { cwd: workDir });
+
+    const { generateGitBundle } = require("./generate_git_bundle.cjs");
+    const result = await generateGitBundle("pr-branch", "main", {
+      mode: "incremental",
+      cwd: workDir,
+      excludedFiles: ["ignored.txt"],
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.bundlePath).toBeTruthy();
+    bundlePaths.push(result.bundlePath);
+  });
+
   it("includes refs/heads/<branchName> in bundle when agent is on the target branch (non-main dispatch scenario)", async () => {
     // Simulates: scanner dispatches worker from a feature branch (non-main ref).
     // The worker checks out the feature branch, creates a new fix branch, commits on

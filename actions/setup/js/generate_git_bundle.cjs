@@ -244,9 +244,11 @@ async function generateGitBundle(branchName, baseBranch, options = {}) {
             }
 
             const tempWorktree = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-filtered-bundle-"));
+            const tempHooksDir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-filtered-bundle-hooks-"));
+            const noHooksConfig = `core.hooksPath=${tempHooksDir.replace(/\\/g, "/")}`;
             try {
-              execGitSync(["worktree", "add", "--detach", tempWorktree, baseCommitSha], { cwd });
-              execGitSync(["am", "--3way", patchResult.patchPath], { cwd: tempWorktree });
+              execGitSync(["-c", noHooksConfig, "worktree", "add", "--detach", tempWorktree, baseCommitSha], { cwd });
+              execGitSync(["-c", noHooksConfig, "am", "--3way", patchResult.patchPath], { cwd: tempWorktree });
               execGitSync(["bundle", "create", bundlePath, `${baseCommitSha}..HEAD`], { cwd: tempWorktree });
             } finally {
               try {
@@ -255,6 +257,7 @@ async function generateGitBundle(branchName, baseBranch, options = {}) {
                 debugLog(`Failed to remove temporary filtered-bundle worktree ${tempWorktree}: ${getErrorMessage(removeError)}`);
               }
               fs.rmSync(tempWorktree, { recursive: true, force: true });
+              fs.rmSync(tempHooksDir, { recursive: true, force: true });
             }
           } else {
             const bundleCreateArgs = ["bundle", "create", bundlePath, `${baseRef}..${branchName}`];
