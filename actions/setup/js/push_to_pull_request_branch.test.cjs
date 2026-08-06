@@ -2326,6 +2326,97 @@ index 0000000..abc1234
       }
     });
 
+    it("should fetch HEAD when a filtered bundle has no named branch ref", async () => {
+      const bundlePath = canonicalBundlePath("feature-branch");
+      const patchPath = createPatchFile("feature-branch", "small patch content");
+      fs.writeFileSync(bundlePath, "bundle content");
+      const bundleTip = "4f80191700da9afc6d0b20b9ec6c81fb376f8714";
+
+      const pushSignedCommitsModule = require("./push_signed_commits.cjs");
+      const pushSignedSpy = vi.spyOn(pushSignedCommitsModule, "pushSignedCommits").mockResolvedValue(bundleTip);
+
+      try {
+        mockExec.getExecOutput.mockImplementation((cmd, args, options) => {
+          if (cmd === "git" && args[0] === "ls-remote") {
+            return Promise.resolve({ exitCode: 0, stdout: "remote-head\trefs/heads/feature-branch\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "HEAD") {
+            return Promise.resolve({ exitCode: 0, stdout: "remote-head\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+            return Promise.resolve({ exitCode: 0, stdout: "false\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && args[2].startsWith("refs/heads/") && options?.ignoreReturnCode) {
+            return Promise.resolve({ exitCode: 128, stdout: "", stderr: "fatal: couldn't find remote ref refs/heads/feature-branch\n" });
+          }
+          if (cmd === "git" && args[0] === "bundle" && args[1] === "list-heads") {
+            return Promise.resolve({ exitCode: 0, stdout: `${bundleTip} HEAD\n`, stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-list") {
+            return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+          }
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+        });
+
+        const module = await loadModule();
+        const handler = await module.main({});
+        const result = await handler({ branch: "feature-branch", diff_size: 5 * 1024 }, {});
+
+        expect(result.success).toBe(true);
+        expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["fetch", bundlePath, "HEAD:refs/bundles/push-feature-branch"], expect.objectContaining({ ignoreReturnCode: true }));
+      } finally {
+        pushSignedSpy.mockRestore();
+      }
+    });
+
+    it("should recover missing prerequisites when fetching a HEAD-only bundle", async () => {
+      const bundlePath = canonicalBundlePath("feature-branch");
+      const patchPath = createPatchFile("feature-branch", "small patch content");
+      fs.writeFileSync(bundlePath, "bundle content");
+      const bundleTip = "4f80191700da9afc6d0b20b9ec6c81fb376f8714";
+      const missingSha = "172f87a830f57a29470efe7646d141069434a893";
+
+      const pushSignedCommitsModule = require("./push_signed_commits.cjs");
+      const pushSignedSpy = vi.spyOn(pushSignedCommitsModule, "pushSignedCommits").mockResolvedValue(bundleTip);
+
+      try {
+        mockExec.getExecOutput.mockImplementation((cmd, args, options) => {
+          if (cmd === "git" && args[0] === "ls-remote") {
+            return Promise.resolve({ exitCode: 0, stdout: "remote-head\trefs/heads/feature-branch\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "HEAD") {
+            return Promise.resolve({ exitCode: 0, stdout: "remote-head\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+            return Promise.resolve({ exitCode: 0, stdout: "false\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && args[2].startsWith("refs/heads/") && options?.ignoreReturnCode) {
+            return Promise.resolve({ exitCode: 128, stdout: "", stderr: "fatal: couldn't find remote ref refs/heads/feature-branch\n" });
+          }
+          if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && args[2].startsWith("HEAD:") && options?.ignoreReturnCode) {
+            return Promise.resolve({ exitCode: 1, stdout: "", stderr: `error: Repository lacks these prerequisite commits:\nerror: ${missingSha}\n` });
+          }
+          if (cmd === "git" && args[0] === "bundle" && args[1] === "list-heads") {
+            return Promise.resolve({ exitCode: 0, stdout: `${bundleTip} HEAD\n`, stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-list") {
+            return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+          }
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+        });
+
+        const module = await loadModule();
+        const handler = await module.main({});
+        const result = await handler({ branch: "feature-branch", diff_size: 5 * 1024 }, {});
+
+        expect(result.success).toBe(true);
+        expect(mockExec.exec).toHaveBeenCalledWith("git", ["fetch", "origin", missingSha], expect.any(Object));
+        expect(mockExec.exec).toHaveBeenCalledWith("git", ["fetch", bundlePath, "HEAD:refs/bundles/push-feature-branch"], expect.any(Object));
+      } finally {
+        pushSignedSpy.mockRestore();
+      }
+    });
+
     it("should fetch prerequisite commits and retry bundle fetch when bundle lacks prerequisites", async () => {
       const bundlePath = canonicalBundlePath("feature-branch");
       const patchPath = createPatchFile("feature-branch", "small patch content");

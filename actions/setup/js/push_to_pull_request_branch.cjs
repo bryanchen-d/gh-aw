@@ -1044,7 +1044,41 @@ async function main(config = {}) {
               await exec.exec("git", ["fetch", bundleFilePath, bundleFetchRef], baseGitOpts);
               core.info("Bundle fetch retry succeeded after prerequisite recovery");
             } else {
-              throw new Error(`Failed to fetch bundle: ${initialFetchErrorOutput}`);
+              const { stdout: bundleHeadsOutput } = await exec.getExecOutput("git", ["bundle", "list-heads", bundleFilePath], baseGitOpts);
+              const branchRefs = bundleHeadsOutput
+                .split("\n")
+                .map(line => line.trim().split(/\s+/)[1] || "")
+                .filter(ref => /^refs\/heads\/[A-Za-z0-9._][A-Za-z0-9._/-]*$/.test(ref));
+              const headOnly = bundleHeadsOutput
+                .split("\n")
+                .map(line => line.trim())
+                .some(line => /^[0-9a-f]{40}\s+HEAD$/.test(line));
+
+              let resolvedBundleRef;
+              if (branchRefs.length === 1) {
+                resolvedBundleRef = branchRefs[0];
+              } else if (branchRefs.length === 0 && headOnly) {
+                resolvedBundleRef = "HEAD";
+              } else {
+                throw new Error(`Failed to fetch bundle: ${initialFetchErrorOutput}`);
+              }
+
+              core.warning(`Bundle does not contain ${bundleFetchRef.split(":")[0]}; fetching ${resolvedBundleRef} instead`);
+              const resolvedBundleFetch = await exec.getExecOutput("git", ["fetch", bundleFilePath, `${resolvedBundleRef}:${bundleRef}`], { ...baseGitOpts, ignoreReturnCode: true });
+              if (resolvedBundleFetch.exitCode !== 0) {
+                const resolvedFetchErrorOutput = resolvedBundleFetch.stderr || `exit code ${resolvedBundleFetch.exitCode}`;
+                const resolvedPrerequisiteCommits = extractBundlePrerequisiteCommits(resolvedFetchErrorOutput);
+                if (resolvedPrerequisiteCommits.length === 0) {
+                  throw new Error(`Failed to fetch resolved bundle ref ${resolvedBundleRef}: ${resolvedFetchErrorOutput}`);
+                }
+
+                core.warning(`Resolved bundle fetch failed due to ${resolvedPrerequisiteCommits.length} missing prerequisite commit(s); fetching prerequisites from ${branchRemoteName} and retrying`);
+                const useBlobFilter = await isShallowOrSparseCheckout(exec, baseGitOpts);
+                const resolvedPrerequisiteFetchArgs = useBlobFilter ? ["fetch", "--filter=blob:none", branchRemoteName, ...resolvedPrerequisiteCommits] : ["fetch", branchRemoteName, ...resolvedPrerequisiteCommits];
+                await withGitHubHostToken(pushRemoteUrl ? headGitHubToken : "", async () => exec.exec("git", resolvedPrerequisiteFetchArgs, baseGitOpts), baseGitOpts.cwd);
+                await exec.exec("git", ["fetch", bundleFilePath, `${resolvedBundleRef}:${bundleRef}`], baseGitOpts);
+              }
+              core.info(`Fetched resolved bundle ref ${resolvedBundleRef} to ${bundleRef}`);
             }
           }
           core.info(`Fetched bundle to ${bundleRef}`);
