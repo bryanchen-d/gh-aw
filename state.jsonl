@@ -75,3 +75,4 @@
 {"run_id":"30818258640","timestamp":"2026-08-03T13:32:12.507Z","assignments":{"prompt_compression":"caveman"}}
 {"run_id":"30912707194","timestamp":"2026-08-04T13:14:18.917Z","assignments":{"prompt_compression":"caveman"}}
 {"run_id":"31113467025","timestamp":"2026-08-06T14:59:34.364Z","assignments":{"prompt_compression":"verbose"}}
+{"run_id":"31184893587","timestamp":"2026-08-07T13:55:33.745Z","assignments":{"prompt_compression":"caveman"}}
